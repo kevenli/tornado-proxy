@@ -257,6 +257,9 @@ def run_proxy(port, start_ioloop=True):
     Run proxy on the specified port. If start_ioloop is True (default),
     the tornado IOLoop will be started immediately.
     """
+    import asyncio
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     app = tornado.web.Application([
         (r'.*', ProxyHandler),
     ], debug=True)
