@@ -29,7 +29,9 @@ import logging
 import os
 import sys
 import socket
-from urlparse import urlparse
+#from urlparse import urlparse
+from urllib.parse import urlparse
+from io import BytesIO
 
 import tornado.httpserver
 import tornado.ioloop
@@ -37,8 +39,10 @@ import tornado.iostream
 import tornado.web
 import tornado.httpclient
 import tornado.httputil
+import tornado.gen
 
 logger = logging.getLogger('tornado_proxy')
+logger.setLevel(logging.DEBUG)
 
 __all__ = ['ProxyHandler', 'run_proxy']
 
@@ -66,7 +70,14 @@ def fetch_request(url, callback, **kwargs):
 
     req = tornado.httpclient.HTTPRequest(url, **kwargs)
     client = tornado.httpclient.AsyncHTTPClient()
-    client.fetch(req, callback, raise_error=False)
+    #future = client.fetch(req, callback, raise_error=False)
+    #future = client.fetch(req, raise_error=False, callback=callback)
+    future = client.fetch(req, raise_error=False)
+    def future_callback(p_future):
+        response = p_future.result()
+        callback(response)
+    future.add_done_callback(future_callback)
+    #future.add
 
 
 class ProxyHandler(tornado.web.RequestHandler):
@@ -75,7 +86,8 @@ class ProxyHandler(tornado.web.RequestHandler):
     def compute_etag(self):
         return None # disable tornado Etag
 
-    @tornado.web.asynchronous
+    #@tornado.web.asynchronous
+    @tornado.gen.coroutine
     def get(self):
         logger.debug('Handle %s request to %s', self.request.method,
                      self.request.uri)
@@ -117,23 +129,48 @@ class ProxyHandler(tornado.web.RequestHandler):
                 self.write('Internal server error:\n' + str(e))
                 self.finish()
 
-    @tornado.web.asynchronous
+    #@tornado.web.asynchronous
+    @tornado.gen.coroutine
     def post(self):
         return self.get()
 
-    @tornado.web.asynchronous
+    #@tornado.web.asynchronous
+    @tornado.gen.coroutine
     def connect(self):
         logger.debug('Start CONNECT to %s', self.request.uri)
         host, port = self.request.uri.split(':')
         client = self.request.connection.stream
 
-        def read_from_client(data):
-            upstream.write(data)
+        def read_from_client():
+            future = client.read_bytes(1024, partial=True)
+            future.add_done_callback(read_from_client_callback)
+            return future
 
-        def read_from_upstream(data):
-            client.write(data)
+        def read_from_client_callback(future):
+            try:
+                data = future.result()
+                logger.debug(f'read_from_client_callback len: {len(data)}')
+                upstream.write(data)
+                return read_from_client()
+            except:
+                logger.debug('client closed')
+
+        def read_from_upstream():
+            future = upstream.read_bytes(1024, partial=True)
+            future.add_done_callback(read_from_upstream_callback)
+            return future
+
+        def read_from_upstream_callback(future):
+            try:
+                data = future.result()
+                client.write(data)
+                return read_from_upstream()
+            except:
+                logger.debug('upstream closed')
+        
 
         def client_close(data=None):
+            logger.debug('client_close')
             if upstream.closed():
                 return
             if data:
@@ -141,17 +178,43 @@ class ProxyHandler(tornado.web.RequestHandler):
             upstream.close()
 
         def upstream_close(data=None):
+            logger.debug('upstream_close')
             if client.closed():
                 return
             if data:
                 client.write(data)
             client.close()
 
+        @tornado.gen.coroutine
         def start_tunnel():
             logger.debug('CONNECT tunnel established to %s', self.request.uri)
-            client.read_until_close(client_close, read_from_client)
-            upstream.read_until_close(upstream_close, read_from_upstream)
-            client.write(b'HTTP/1.0 200 Connection established\r\n\r\n')
+            #client.read_until_close(client_close, read_from_client)
+            #read_buffer = yield client.read_until_close()
+            client.set_close_callback(client_close)
+            upstream.set_close_callback(upstream_close)
+            yield client.write(b'HTTP/1.0 200 Connection established\r\n\r\n')
+#            while not client.closed() and not upstream.closed():
+            logger.debug('manipulating streams')
+                #down_stream_buffer = yield client.read_bytes(1024000, partial=True)
+                #yield upstream.write(down_stream_buffer)
+                #logger.debug(f'down_stream_buffer size {len(down_stream_buffer)}')
+            read_from_client()
+ #               up_stream_buffer = yield upstream.read_bytes(1024000, partial=True)
+  #              yield client.write(up_stream_buffer)
+  #              logger.debug(f'up_stream_buffer size {len(up_stream_buffer)}')
+            read_from_upstream()
+            #while wrote:
+            #    wrote = yield client.read_into(self.upstream)
+                
+            #self.read_from_client(read_buffer)
+            #self.clien_close(read_buffer)
+            #client_close()
+            #upstream.read_until_close(upstream_close, read_from_upstream)
+            #upstream_read_buffer = yield upstream.read_until_close()
+            #self.upstream_close(upstream_read_buffer)
+            #wrote = yield upstream.read_into(self.upstream)
+            #while wrote:
+            #    wrote = yield client.read_into(self.upstream)
 
         def on_proxy_response(data=None):
             if data:
@@ -166,6 +229,7 @@ class ProxyHandler(tornado.web.RequestHandler):
             self.finish()
 
         def start_proxy_tunnel():
+            logger.debug('start_proxy_tunnel')
             upstream.write('CONNECT %s HTTP/1.1\r\n' % self.request.uri)
             upstream.write('Host: %s\r\n' % self.request.uri)
             upstream.write('Proxy-Connection: Keep-Alive\r\n\r\n')
@@ -178,8 +242,14 @@ class ProxyHandler(tornado.web.RequestHandler):
         if proxy:
             proxy_host, proxy_port = parse_proxy(proxy)
             upstream.connect((proxy_host, proxy_port), start_proxy_tunnel)
+            logger.debug(f'upstream.connect via proxy {proxy_host} {proxy_port}')
         else:
-            upstream.connect((host, int(port)), start_tunnel)
+            #upstream.connect((host, int(port)), start_tunnel)
+            #connect_future = upstream.connect((host, int(port)))
+            #connect_future.add_done_callback(lambda x: start_tunnel())
+            logger.debug(f'upstream.connect {host}, {port}')
+            yield upstream.connect((host, int(port)))
+            yield start_tunnel()
 
 
 def run_proxy(port, start_ioloop=True):
@@ -189,7 +259,7 @@ def run_proxy(port, start_ioloop=True):
     """
     app = tornado.web.Application([
         (r'.*', ProxyHandler),
-    ])
+    ], debug=True)
     app.listen(port)
     ioloop = tornado.ioloop.IOLoop.instance()
     if start_ioloop:
